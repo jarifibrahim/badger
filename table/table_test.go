@@ -17,7 +17,9 @@
 package table
 
 import (
+	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"hash/crc32"
 	"math/rand"
@@ -25,6 +27,9 @@ import (
 	"sort"
 	"testing"
 	"time"
+
+	"github.com/dgraph-io/badger/pb"
+	"github.com/dustin/go-humanize"
 
 	"github.com/cespare/xxhash"
 	"github.com/dgraph-io/badger/options"
@@ -768,5 +773,116 @@ func TestBlockChecksum(t *testing.T) {
 		require.NoError(t, err, "error while getting block")
 
 		require.NoError(t, b.VerifyCheckSum(), "error in checksum verification")
+	}
+}
+
+func BenchmarkProtocolBuffers(b *testing.B) {
+	temp := make([]uint32, 5*1e7)
+	fmt.Println(humanize.Bytes(uint64(len(temp))))
+	for i := 0; i < len(temp); i++ {
+		temp[i] = uint32(rand.Int31())
+	}
+
+	b.Run("proto", func(b *testing.B) {
+		m := pb.BlockMeta{
+			EntryOffsets: temp,
+		}
+		mBuf, err := m.Marshal()
+		b.Logf("proto %s", humanize.Bytes(uint64(len(mBuf))))
+		require.NoError(b, err)
+		k := pb.BlockMeta{}
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			k.Reset()
+			require.NoError(b, k.Unmarshal(mBuf))
+		}
+		b.StopTimer()
+		require.EqualValues(b, temp, k.EntryOffsets)
+	})
+	b.Run("proto with offset diff", func(b *testing.B) {
+		diffTemp := make([]uint32, len(temp))
+		diffTemp[0] = temp[0]
+		for i := 1; i < len(temp); i++ {
+			diffTemp[i] = temp[i] - temp[i-1]
+		}
+		m := pb.BlockMeta{
+			EntryOffsets: diffTemp,
+		}
+		mBuf, err := m.Marshal()
+		b.Logf("proto with diff %s", humanize.Bytes(uint64(len(mBuf))))
+		require.NoError(b, err)
+		k := pb.BlockMeta{}
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			k.Reset()
+			require.NoError(b, k.Unmarshal(mBuf))
+			for j := 1; j < len(k.EntryOffsets); j++ {
+				k.EntryOffsets[j] += k.EntryOffsets[j-1]
+			}
+		}
+		b.StopTimer()
+		require.EqualValues(b, temp, k.EntryOffsets)
+	})
+	b.Run("manual", func(b *testing.B) {
+		ebuf := make([]byte, len(temp)*4)
+		e1 := ebuf
+		for i := len(temp) - 1; i >= 0; i-- {
+			binary.BigEndian.PutUint32(e1[:4], temp[i])
+			e1 = e1[4:]
+		}
+		entryOffsets := make([]uint32, len(temp))
+		b.Logf("manual %s", humanize.Bytes(uint64(len(ebuf))))
+		b.ResetTimer()
+		for j := 0; j < b.N; j++ {
+			readPos := len(ebuf) - 4
+			for i := 0; i < len(temp); i++ {
+				entryOffsets[i] = binary.BigEndian.Uint32(ebuf[readPos : readPos+4])
+				readPos -= 4
+			}
+		}
+		b.StopTimer()
+		require.EqualValues(b, temp, entryOffsets)
+	})
+
+}
+
+func BenchmarkReadRandom(b *testing.B) {
+	r := rand.New(rand.NewSource(time.Now().Unix()))
+	n := 5 << 20
+	builder := NewTableBuilder()
+	filename := fmt.Sprintf("%s%s%d.sst", os.TempDir(), string(os.PathSeparator), r.Int63())
+	f, err := y.OpenSyncedFile(filename, true)
+	y.Check(err)
+	for i := 0; i < n; i++ {
+		k := fmt.Sprintf("%016x", i)
+		v := fmt.Sprintf("%d", i)
+		y.Check(builder.Add([]byte(k), y.ValueStruct{Value: []byte(v), Meta: 123, UserMeta: 0}))
+	}
+
+	f.Write(builder.Finish())
+	tbl, err := OpenTable(f, options.MemoryMap, nil)
+	y.Check(err)
+	defer tbl.DecrRef()
+
+	itr := tbl.NewIterator(false)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		itr.seekToFirst()
+		no := r.Intn(n)
+		k := []byte(fmt.Sprintf("%016x", no))
+		v := []byte(fmt.Sprintf("%d", no))
+		b.StartTimer()
+		itr.Seek(k)
+		if !itr.Valid() {
+			b.Fatal(itr.err)
+			b.Fatal("itr should be valid")
+		}
+		v1 := itr.Value().Value
+
+		if !bytes.Equal(v, v1) {
+			fmt.Println("value does not match")
+			b.Fatal()
+		}
 	}
 }

@@ -64,6 +64,8 @@ type Table struct {
 	bf bbloom.Bloom
 
 	Checksum []byte
+
+	bm map[int]*block
 }
 
 // IncrRef increments the refcount (having to do with whether the file should be deleted)
@@ -98,8 +100,9 @@ func (t *Table) DecrRef() error {
 }
 
 type block struct {
-	offset int
-	data   []byte
+	offset       int
+	data         []byte
+	entryOffsets []uint32
 }
 
 func (b block) VerifyCheckSum() error {
@@ -118,23 +121,7 @@ func (b block) VerifyCheckSum() error {
 }
 
 func (b block) NewIterator() *blockIterator {
-	bi := &blockIterator{data: b.data}
-
-	// first read checksum size
-	readPos := len(b.data) - 4
-	csSize := int(binary.BigEndian.Uint32(bi.data[readPos : readPos+4]))
-
-	readPos -= (csSize + 4) // skip reading checksum, and move position to block meta length
-	metaSize := int(binary.BigEndian.Uint32(bi.data[readPos : readPos+4]))
-
-	// read block meta
-	readPos -= metaSize
-	bm := &pb.BlockMeta{}
-	err := bm.Unmarshal(bi.data[readPos : readPos+metaSize])
-	y.Check(err) // TODO(Ashish): avoid this.
-
-	bi.entryOffsets = bm.EntryOffsets
-
+	bi := &blockIterator{data: b.data, entryOffsets: b.entryOffsets}
 	return bi
 }
 
@@ -162,6 +149,7 @@ func OpenTable(fd *os.File, mode options.FileLoadingMode, cksum []byte) (*Table,
 		ref:         1, // Caller is given one reference.
 		id:          id,
 		loadingMode: mode,
+		bm:          make(map[int]*block),
 	}
 
 	t.tableSize = int(fileInfo.Size())
@@ -282,6 +270,9 @@ func (t *Table) readIndex() error {
 }
 
 func (t *Table) block(idx int) (block, error) {
+	if b, ok := t.bm[idx]; ok {
+		return *b, nil
+	}
 	y.AssertTruef(idx >= 0, "idx=%d", idx)
 	if idx >= len(t.blockIndex) {
 		return block{}, errors.New("block out of index")
@@ -293,6 +284,22 @@ func (t *Table) block(idx int) (block, error) {
 	}
 	var err error
 	blk.data, err = t.read(blk.offset, int(ko.Len))
+	// first read checksum size
+	readPos := len(blk.data) - 4
+	csSize := int(binary.BigEndian.Uint32(blk.data[readPos : readPos+4]))
+
+	readPos -= (csSize + 4) // skip reading checksum, and move position to block meta length
+	metaSize := int(binary.BigEndian.Uint32(blk.data[readPos : readPos+4]))
+
+	// read block meta
+	readPos -= metaSize
+	bm := &pb.BlockMeta{}
+	err = bm.Unmarshal(blk.data[readPos : readPos+metaSize])
+	y.Check(err) // TODO(Ashish): avoid this.
+
+	blk.entryOffsets = bm.EntryOffsets
+
+	t.bm[idx] = &blk
 	return blk, err
 }
 
