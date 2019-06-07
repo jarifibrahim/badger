@@ -27,11 +27,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dgraph-io/badger/pb"
+	"github.com/dgryski/go-groupvarint"
+
 	"github.com/dustin/go-humanize"
 
 	"github.com/cespare/xxhash"
 	"github.com/dgraph-io/badger/options"
+	"github.com/dgraph-io/badger/pb"
 	"github.com/dgraph-io/badger/y"
 	"github.com/stretchr/testify/require"
 )
@@ -777,14 +779,48 @@ func TestBlockChecksum(t *testing.T) {
 
 func BenchmarkProtocolBuffers(b *testing.B) {
 	rand.Seed(time.Now().UnixNano())
-	keyCount := int32(5 * 1e7)
+	keyCount := int32(4 * 1e7) // should be in multiple of 4 for groupvarint to work
 	temp := make([]uint32, keyCount)
 	for i := 0; i < len(temp); i++ {
 		temp[i] = uint32(i) + uint32(rand.Int31n(keyCount*4)) // keyCount * 4 to reduce collision (we want distinct offsets)
 	}
 
 	sort.Slice(temp, func(i, j int) bool { return temp[i] < temp[j] })
+	diffTemp := make([]uint32, len(temp))
+	diffTemp[0] = temp[0]
+	for i := 1; i < len(temp); i++ {
+		diffTemp[i] = temp[i] - temp[i-1]
+	}
 
+	b.Run("diff with groupvarint", func(b *testing.B) {
+		// Encode data
+		data := make([]byte, 0)
+		for i := 0; i <= len(diffTemp)-4; i += 4 {
+			buf := make([]byte, 17)
+			tempdata := groupvarint.Encode4(buf, diffTemp[i:i+4])
+			data = append(data, tempdata...)
+		}
+		deltas := append(data, 0, 0, 0)
+		b.Logf("diff with groupvarint %s", humanize.Bytes(uint64(len(deltas))))
+		b.ResetTimer()
+		buf := make([]uint32, 4)
+		for j := 0; j < b.N; j++ {
+			b.StopTimer()
+			deltaCopy := make([]byte, len(deltas))
+			entryOffsets := make([]uint32, 0)
+			copy(deltaCopy, deltas)
+			b.StartTimer()
+			// decode data
+			for len(deltaCopy) >= 5 {
+				groupvarint.Decode4(buf, deltaCopy)
+				deltaCopy = deltaCopy[groupvarint.BytesUsed[deltaCopy[0]]:]
+				entryOffsets = append(entryOffsets, buf...)
+			}
+			b.StopTimer()
+			require.Equal(b, diffTemp, entryOffsets)
+			b.StartTimer()
+		}
+	})
 	b.Run("proto", func(b *testing.B) {
 		m := pb.BlockMeta{
 			EntryOffsets: temp,
@@ -802,11 +838,6 @@ func BenchmarkProtocolBuffers(b *testing.B) {
 		require.EqualValues(b, temp, k.EntryOffsets)
 	})
 	b.Run("proto with offset diff", func(b *testing.B) {
-		diffTemp := make([]uint32, len(temp))
-		diffTemp[0] = temp[0]
-		for i := 1; i < len(temp); i++ {
-			diffTemp[i] = temp[i] - temp[i-1]
-		}
 		m := pb.BlockMeta{
 			EntryOffsets: diffTemp,
 		}
