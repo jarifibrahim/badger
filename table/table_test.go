@@ -17,7 +17,6 @@
 package table
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
@@ -777,18 +776,21 @@ func TestBlockChecksum(t *testing.T) {
 }
 
 func BenchmarkProtocolBuffers(b *testing.B) {
-	temp := make([]uint32, 5*1e7)
-	fmt.Println(humanize.Bytes(uint64(len(temp))))
+	rand.Seed(time.Now().UnixNano())
+	keyCount := int32(5 * 1e7)
+	temp := make([]uint32, keyCount)
 	for i := 0; i < len(temp); i++ {
-		temp[i] = uint32(rand.Int31())
+		temp[i] = uint32(i) + uint32(rand.Int31n(keyCount*4)) // keyCount * 4 to reduce collision (we want distinct offsets)
 	}
+
+	sort.Slice(temp, func(i, j int) bool { return temp[i] < temp[j] })
 
 	b.Run("proto", func(b *testing.B) {
 		m := pb.BlockMeta{
 			EntryOffsets: temp,
 		}
 		mBuf, err := m.Marshal()
-		b.Logf("proto %s", humanize.Bytes(uint64(len(mBuf))))
+		b.Logf("buf length with proto %s", humanize.Bytes(uint64(len(mBuf))))
 		require.NoError(b, err)
 		k := pb.BlockMeta{}
 		b.ResetTimer()
@@ -809,7 +811,7 @@ func BenchmarkProtocolBuffers(b *testing.B) {
 			EntryOffsets: diffTemp,
 		}
 		mBuf, err := m.Marshal()
-		b.Logf("proto with diff %s", humanize.Bytes(uint64(len(mBuf))))
+		b.Logf("buf length proto with diff %s", humanize.Bytes(uint64(len(mBuf))))
 		require.NoError(b, err)
 		k := pb.BlockMeta{}
 		b.ResetTimer()
@@ -831,7 +833,7 @@ func BenchmarkProtocolBuffers(b *testing.B) {
 			e1 = e1[4:]
 		}
 		entryOffsets := make([]uint32, len(temp))
-		b.Logf("manual %s", humanize.Bytes(uint64(len(ebuf))))
+		b.Logf("buf length manual %s", humanize.Bytes(uint64(len(ebuf))))
 		b.ResetTimer()
 		for j := 0; j < b.N; j++ {
 			readPos := len(ebuf) - 4
@@ -844,45 +846,4 @@ func BenchmarkProtocolBuffers(b *testing.B) {
 		require.EqualValues(b, temp, entryOffsets)
 	})
 
-}
-
-func BenchmarkReadRandom(b *testing.B) {
-	r := rand.New(rand.NewSource(time.Now().Unix()))
-	n := 5 << 20
-	builder := NewTableBuilder()
-	filename := fmt.Sprintf("%s%s%d.sst", os.TempDir(), string(os.PathSeparator), r.Int63())
-	f, err := y.OpenSyncedFile(filename, true)
-	y.Check(err)
-	for i := 0; i < n; i++ {
-		k := fmt.Sprintf("%016x", i)
-		v := fmt.Sprintf("%d", i)
-		y.Check(builder.Add([]byte(k), y.ValueStruct{Value: []byte(v), Meta: 123, UserMeta: 0}))
-	}
-
-	f.Write(builder.Finish())
-	tbl, err := OpenTable(f, options.MemoryMap, nil)
-	y.Check(err)
-	defer tbl.DecrRef()
-
-	itr := tbl.NewIterator(false)
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		b.StopTimer()
-		itr.seekToFirst()
-		no := r.Intn(n)
-		k := []byte(fmt.Sprintf("%016x", no))
-		v := []byte(fmt.Sprintf("%d", no))
-		b.StartTimer()
-		itr.Seek(k)
-		if !itr.Valid() {
-			b.Fatal(itr.err)
-			b.Fatal("itr should be valid")
-		}
-		v1 := itr.Value().Value
-
-		if !bytes.Equal(v, v1) {
-			fmt.Println("value does not match")
-			b.Fatal()
-		}
-	}
 }
