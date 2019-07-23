@@ -60,7 +60,7 @@ func (h header) Size() int { return 8 }
 // Builder is used in building a table.
 type Builder struct {
 	// Typically tens or hundreds of meg. This is for one single file.
-	buf *bytes.Buffer
+	buf []byte
 
 	blockSize    uint32   // Max size of block.
 	baseKey      []byte   // Base key for the current block.
@@ -74,10 +74,10 @@ type Builder struct {
 }
 
 // NewTableBuilder makes a new TableBuilder.
-func NewTableBuilder() *Builder {
+func NewTableBuilder(capacity int64) *Builder {
 	return &Builder{
 		keyBuf:     newBuffer(1 << 20),
-		buf:        newBuffer(1 << 20),
+		buf:        make([]byte, 0, capacity),
 		tableIndex: &pb.TableIndex{},
 
 		// TODO(Ashish): make this configurable
@@ -89,7 +89,7 @@ func NewTableBuilder() *Builder {
 func (b *Builder) Close() {}
 
 // Empty returns whether it's empty.
-func (b *Builder) Empty() bool { return b.buf.Len() == 0 }
+func (b *Builder) Empty() bool { return len(b.buf) == 0 }
 
 // keyDiff returns a suffix of newKey that is different from b.baseKey.
 func (b Builder) keyDiff(newKey []byte) []byte {
@@ -131,16 +131,15 @@ func (b *Builder) addHelper(key []byte, v y.ValueStruct) {
 	}
 
 	// store current entry's offset
-	y.AssertTrue(b.buf.Len() < math.MaxUint32)
-	b.entryOffsets = append(b.entryOffsets, uint32(b.buf.Len())-b.baseOffset)
+	y.AssertTrue(len(b.buf) < math.MaxUint32)
+	b.entryOffsets = append(b.entryOffsets, uint32(len(b.buf))-b.baseOffset)
 
 	// Layout: header, diffKey, value.
 	var hbuf [8]byte
 	h.Encode(hbuf[:])
-	b.buf.Write(hbuf[:])
-	b.buf.Write(diffKey) // We only need to store the key difference.
-
-	v.EncodeTo(b.buf)
+	b.buf = append(b.buf, hbuf[:]...)
+	b.buf = append(b.buf, diffKey...) // We only need to store the key difference.
+	b.buf = v.EncodeTo(b.buf)
 }
 
 /*
@@ -160,9 +159,9 @@ func (b *Builder) finishBlock() {
 		binary.BigEndian.PutUint32(ebuf[4*i:4*i+4], uint32(offset))
 	}
 	binary.BigEndian.PutUint32(ebuf[len(ebuf)-4:], uint32(len(b.entryOffsets)))
-	b.buf.Write(ebuf)
+	b.buf = append(b.buf, ebuf...)
 
-	blockBuf := b.buf.Bytes()[b.baseOffset:] // Store checksum for current block.
+	blockBuf := b.buf[b.baseOffset:] // Store checksum for current block.
 	b.writeChecksum(blockBuf)
 
 	// TODO(Ashish):Add padding: If we want to make block as multiple of OS pages, we can
@@ -172,7 +171,7 @@ func (b *Builder) finishBlock() {
 	bo := &pb.BlockOffset{
 		Key:    y.Copy(b.baseKey),
 		Offset: b.baseOffset,
-		Len:    uint32(b.buf.Len()) - b.baseOffset,
+		Len:    uint32(len(b.buf)) - b.baseOffset,
 	}
 	b.tableIndex.Offsets = append(b.tableIndex.Offsets, bo)
 }
@@ -189,7 +188,7 @@ func (b *Builder) shouldFinishBlock(key []byte, value y.ValueStruct) bool {
 		4 + // size of list
 		8 + // Sum64 in checksum proto
 		4) // checksum length
-	estimatedSize := uint32(b.buf.Len()) - b.baseOffset + uint32(6 /*header size for entry*/) +
+	estimatedSize := uint32(len(b.buf)) - b.baseOffset + uint32(6 /*header size for entry*/) +
 		uint32(len(key)) + uint32(value.EncodedSize()) + entriesOffsetsSize
 
 	return estimatedSize > b.blockSize
@@ -201,8 +200,8 @@ func (b *Builder) Add(key []byte, value y.ValueStruct) error {
 		b.finishBlock()
 		// Start a new block. Initialize the block.
 		b.baseKey = []byte{}
-		y.AssertTrue(b.buf.Len() < math.MaxUint32)
-		b.baseOffset = uint32(b.buf.Len())
+		y.AssertTrue(len(b.buf) < math.MaxUint32)
+		b.baseOffset = uint32(len(b.buf))
 		b.entryOffsets = b.entryOffsets[:0]
 	}
 	b.addHelper(key, value)
@@ -217,7 +216,7 @@ func (b *Builder) Add(key []byte, value y.ValueStruct) error {
 
 // ReachedCapacity returns true if we... roughly (?) reached capacity?
 func (b *Builder) ReachedCapacity(cap int64) bool {
-	blocksSize := b.buf.Len() + // length of current buffer
+	blocksSize := len(b.buf) + // length of current buffer
 		len(b.entryOffsets)*4 + // all entry offsets size
 		4 + // count of all entry offsets
 		8 + // checksum bytes
@@ -266,18 +265,16 @@ func (b *Builder) Finish() []byte {
 	index, err := b.tableIndex.Marshal()
 	y.Check(err)
 	// Write index the file.
-	n, err := b.buf.Write(index)
-	y.Check(err)
+	b.buf = append(b.buf, index...)
 
-	y.AssertTrue(n < math.MaxUint32)
+	y.AssertTrue(len(index) < math.MaxUint32)
 	// Write index size.
 	var buf [4]byte
-	binary.BigEndian.PutUint32(buf[:], uint32(n))
-	_, err = b.buf.Write(buf[:])
-	y.Check(err)
+	binary.BigEndian.PutUint32(buf[:], uint32(len(index)))
+	b.buf = append(b.buf, buf[:]...)
 
 	b.writeChecksum(index)
-	return b.buf.Bytes()
+	return b.buf
 }
 
 func (b *Builder) writeChecksum(data []byte) {
@@ -298,13 +295,11 @@ func (b *Builder) writeChecksum(data []byte) {
 	// Write checksum to the file.
 	chksum, err := checksum.Marshal()
 	y.Check(err)
-	n, err := b.buf.Write(chksum)
-	y.Check(err)
+	b.buf = append(b.buf, chksum...)
 
-	y.AssertTrue(n < math.MaxUint32)
+	y.AssertTrue(len(chksum) < math.MaxUint32)
 	// Write checksum size.
 	var buf [4]byte
-	binary.BigEndian.PutUint32(buf[:], uint32(n))
-	_, err = b.buf.Write(buf[:])
-	y.Check(err)
+	binary.BigEndian.PutUint32(buf[:], uint32(len(chksum)))
+	b.buf = append(b.buf, buf[:]...)
 }

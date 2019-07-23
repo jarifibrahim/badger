@@ -41,7 +41,7 @@ func TestTableIndex(t *testing.T) {
 
 	t.Run("multiple keys", func(t *testing.T) {
 		keysCount := 10000
-		builder := NewTableBuilder()
+		builder := NewTableBuilder(int64(67 * MB))
 		filename := fmt.Sprintf("%s%c%d.sst", os.TempDir(), os.PathSeparator, rand.Int63())
 		f, err := y.OpenSyncedFile(filename, true)
 		require.NoError(t, err)

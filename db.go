@@ -849,10 +849,10 @@ func arenaSize(opt Options) int64 {
 }
 
 // WriteLevel0Table flushes memtable.
-func writeLevel0Table(ft flushTask, f io.Writer) error {
+func (db *DB) writeLevel0Table(ft flushTask, f io.Writer) error {
 	iter := ft.mt.NewIterator()
 	defer iter.Close()
-	b := table.NewTableBuilder()
+	b := table.NewTableBuilder(db.opt.MaxTableSize)
 	defer b.Close()
 	for iter.SeekToFirst(); iter.Valid(); iter.Next() {
 		if len(ft.dropPrefix) > 0 && bytes.HasPrefix(iter.Key(), ft.dropPrefix) {
@@ -901,7 +901,7 @@ func (db *DB) handleFlushTask(ft flushTask) error {
 	dirSyncCh := make(chan error)
 	go func() { dirSyncCh <- syncDir(db.opt.Dir) }()
 
-	err = writeLevel0Table(ft, fd)
+	err = db.writeLevel0Table(ft, fd)
 	dirSyncErr := <-dirSyncCh
 
 	if err != nil {
