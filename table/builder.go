@@ -19,7 +19,6 @@ package table
 import (
 	"bytes"
 	"encoding/binary"
-	"io"
 	"math"
 
 	"github.com/AndreasBriese/bbloom"
@@ -69,14 +68,15 @@ type Builder struct {
 
 	tableIndex *pb.TableIndex
 
-	keyBuf   *bytes.Buffer
+	keyBuf   []byte
 	keyCount int
 }
 
 // NewTableBuilder makes a new TableBuilder.
 func NewTableBuilder(capacity int64) *Builder {
+	assumedKeyCount := capacity / 25
 	return &Builder{
-		keyBuf:     newBuffer(1 << 20),
+		keyBuf:     make([]byte, 0, assumedKeyCount),
 		buf:        make([]byte, 0, capacity),
 		tableIndex: &pb.TableIndex{},
 
@@ -108,8 +108,8 @@ func (b *Builder) addHelper(key []byte, v y.ValueStruct) {
 		var klen [2]byte
 		keyNoTs := y.ParseKey(key)
 		binary.BigEndian.PutUint16(klen[:], uint16(len(keyNoTs)))
-		b.keyBuf.Write(klen[:])
-		b.keyBuf.Write(keyNoTs)
+		b.keyBuf = append(b.keyBuf, klen[:]...)
+		b.keyBuf = append(b.keyBuf, keyNoTs...)
 		b.keyCount++
 	}
 
@@ -243,18 +243,18 @@ func (b *Builder) Finish() []byte {
 	bf := bbloom.New(float64(b.keyCount), 0.01)
 	var klen [2]byte
 	key := make([]byte, 1024)
-	for {
-		if _, err := b.keyBuf.Read(klen[:]); err == io.EOF {
-			break
-		} else if err != nil {
-			y.Check(err)
-		}
+	for i := 0; i < b.keyCount; i++ {
+		copy(klen[:], b.keyBuf)
+		// Move ahead of key length
+		b.keyBuf = b.keyBuf[2:]
 		kl := int(binary.BigEndian.Uint16(klen[:]))
 		if cap(key) < kl {
 			key = make([]byte, 2*int(kl)) // 2 * uint16 will overflow
 		}
 		key = key[:kl]
-		y.Check2(b.keyBuf.Read(key))
+		copy(key, b.keyBuf)
+		// Move ahead of the key
+		b.keyBuf = b.keyBuf[kl:]
 		bf.Add(key)
 	}
 
