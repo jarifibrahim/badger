@@ -303,54 +303,82 @@ func (t *Throttle) Finish() error {
 	return t.finishErr
 }
 
-// type page struct {
-// 	buf bytes.Buffer
-// }
-
-// NoAllocBuffer ...
 type NoAllocBuffer struct {
 	li       *list.List
-	currBuf  []byte
+	currBuf  bytes.Buffer
 	pageSize int
-	idx      int
 }
 
 // NewNoAllocBuffer ...
 func NewNoAllocBuffer(pageSize int) *NoAllocBuffer {
-	n := &NoAllocBuffer{li: list.New(), currBuf: make([]byte, pageSize), pageSize: pageSize}
+	n := &NoAllocBuffer{li: list.New(), pageSize: pageSize}
+	n.currBuf.Grow(n.pageSize)
 	return n
 }
 
 func (n *NoAllocBuffer) Len() int {
-	return n.idx + n.li.Len()*n.pageSize
+	return n.currBuf.Len() + n.li.Len()*n.pageSize
 }
 func (n *NoAllocBuffer) Write(b []byte) (int, error) {
-	if n.idx+len(b) > n.pageSize {
-		n.li.PushBack(n.currBuf[:n.idx])
-		n.currBuf = make([]byte, n.pageSize)
-		n.idx = 0
+	if n.currBuf.Len()+len(b) > n.pageSize {
+		n.li.PushBack(n.currBuf)
+		n.currBuf = bytes.Buffer{}
+		n.currBuf.Grow(n.pageSize)
 	}
-	AssertTruef(n.idx < len(n.currBuf), "%d should be less than %d", n.idx, len(n.currBuf))
-	copy(n.currBuf[n.idx:], b)
-	n.idx += len(b)
-	return len(b), nil
+	return n.currBuf.Write(b)
 }
 
-func (n *NoAllocBuffer) WriteByte(b byte) (int, error) {
-	return n.Write([]byte{b})
+func (n *NoAllocBuffer) WriteByte(b byte) error {
+	_, err := n.Write([]byte{b})
+	return err
 }
 
+// Bytes with offset
 func (n *NoAllocBuffer) Bytes() []byte {
-	buf := make([]byte, (n.li.Len()*n.pageSize)+n.idx)
-	cur := buf
+	buf := make([]byte, (n.li.Len()*n.pageSize)+n.currBuf.Len())
+	bytesWritten := 0
 	for itr := n.li.Front(); itr != nil; itr = itr.Next() {
-		b := itr.Value.([]byte)
-		copy(cur[:n.pageSize], b)
-		cur = cur[n.pageSize:]
+		b := itr.Value.(bytes.Buffer)
+		copy(buf[bytesWritten:], b.Bytes())
+		bytesWritten += b.Len()
 	}
-	copy(cur[:n.idx], n.currBuf[:n.idx])
-	return buf
+	copy(buf[bytesWritten:], n.currBuf.Bytes())
+	bytesWritten += n.currBuf.Len()
+	return buf[:bytesWritten]
 }
+
+type NoAllocHashReader struct {
+	NoAllocBuffer
+	hashBuffer bytes.Buffer
+}
+
+func NewNoAllocHashReader() *NoAllocHashReader {
+	n := &NoAllocHashReader{}
+	return n
+}
+
+// func (n *NoAllocBuffer) BytesFrom(offset int) ([]byte, error) {
+// 	buf := make([]byte, (n.li.Len()*n.pageSize)+n.currBuf.Len())
+// 	bytesWritten := 0
+// 	// start := n.li.Front()
+// 	// count := 0
+// 	startingPage := offset / n.pageSize
+// 	itr := n.li.Front()
+// 	for count < startingPage {
+// 		if itr == nil {
+// 			return nil, errors.New("fooo")
+// 		}
+// 		count++
+// 	}
+// 	for itr := n.li.Front(); itr != nil; itr = itr.Next() {
+// 		b := itr.Value.(bytes.Buffer)
+// 		copy(buf[bytesWritten:], b.Bytes())
+// 		bytesWritten += b.Len()
+// 	}
+// 	copy(buf[bytesWritten:], n.currBuf.Bytes())
+// 	bytesWritten += n.currBuf.Len()
+// 	return nil, buf[:bytesWritten]
+// }
 
 func (n *NoAllocBuffer) readTo(w io.Writer) {
 
