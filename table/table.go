@@ -260,7 +260,7 @@ func (t *Table) readIndex() error {
 	// Read checksum len from the last 4 bytes.
 	readPos -= 4
 	buf := t.readNoFail(readPos, 4)
-	checksumLen := int(binary.BigEndian.Uint32(buf))
+	checksumLen := int(binary.BigEndian.Uint32(buf[0:4]))
 
 	// Read checksum.
 	expectedChk := &pb.Checksum{}
@@ -273,7 +273,7 @@ func (t *Table) readIndex() error {
 	// Read index size from the footer.
 	readPos -= 4
 	buf = t.readNoFail(readPos, 4)
-	indexLen := int(binary.BigEndian.Uint32(buf))
+	indexLen := int(binary.BigEndian.Uint32(buf[0:4]))
 	// Read index.
 	readPos -= indexLen
 	data := t.readNoFail(readPos, indexLen)
