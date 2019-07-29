@@ -41,6 +41,7 @@ type header struct {
 
 // Encode encodes the header.
 func (h header) Encode(b []byte) {
+	_ = b[7]
 	binary.BigEndian.PutUint16(b[0:2], h.plen)
 	binary.BigEndian.PutUint16(b[2:4], h.klen)
 	binary.BigEndian.PutUint32(b[4:8], h.vlen)
@@ -48,6 +49,7 @@ func (h header) Encode(b []byte) {
 
 // Decode decodes the header.
 func (h *header) Decode(buf []byte) int {
+	_ = buf[7]
 	h.plen = binary.BigEndian.Uint16(buf[0:2])
 	h.klen = binary.BigEndian.Uint16(buf[2:4])
 	h.vlen = binary.BigEndian.Uint32(buf[4:8])
@@ -93,13 +95,12 @@ func (b *Builder) Empty() bool { return b.buf.Len() == 0 }
 
 // keyDiff returns a suffix of newKey that is different from b.baseKey.
 func (b Builder) keyDiff(newKey []byte) []byte {
-	var i int
-	for i = 0; i < len(newKey) && i < len(b.baseKey); i++ {
+	for i := 0; i < len(newKey) && i < len(b.baseKey); i++ {
 		if newKey[i] != b.baseKey[i] {
-			break
+			return newKey[i:]
 		}
 	}
-	return newKey[i:]
+	return newKey
 }
 
 func (b *Builder) addHelper(key []byte, v y.ValueStruct) {

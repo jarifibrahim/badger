@@ -73,3 +73,17 @@ func TestTableIndex(t *testing.T) {
 		}
 	})
 }
+
+var e error
+
+func BenchmarkReadIndex(b *testing.B) {
+	var x error
+	tbl := getTableForBenchmarks(b, 10000)
+	b.ResetTimer()
+	b.Run("bench", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			x = tbl.readIndex()
+		}
+		e = x
+	})
+}
