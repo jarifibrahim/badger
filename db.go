@@ -317,8 +317,7 @@ func Open(opt Options) (db *DB, err error) {
 		vptr.Decode(vs.Value)
 	}
 
-	replayCloser := y.NewCloser(1)
-	go db.doWrites(replayCloser)
+	replayCloser := startWriteWorker(db)
 
 	if err = db.vlog.open(db, vptr, db.replayFunction()); err != nil {
 		return db, err
@@ -334,8 +333,7 @@ func Open(opt Options) (db *DB, err error) {
 	db.orc.incrementNextTs()
 
 	db.writeCh = make(chan *request, kvWriteChCapacity)
-	db.closers.writes = y.NewCloser(1)
-	go db.doWrites(db.closers.writes)
+	db.closers.writes = startWriteWorker(db)
 
 	db.closers.valueGC = y.NewCloser(1)
 	go db.vlog.waitOnGC(db.closers.valueGC)
@@ -374,8 +372,8 @@ func (db *DB) close() (err error) {
 	// Stop writes next.
 	db.closers.writes.SignalAndWait()
 
-	// Don't accept any more write.
-	close(db.writeCh)
+	// // Don't accept any more write.
+	// close(db.writeCh)
 
 	db.closers.pub.SignalAndWait()
 
@@ -587,92 +585,6 @@ func (db *DB) shouldWriteValueToLSM(e Entry) bool {
 	return len(e.Value) < db.opt.ValueThreshold
 }
 
-func (db *DB) writeToLSM(b *request) error {
-	if len(b.Ptrs) != len(b.Entries) {
-		return errors.Errorf("Ptrs and Entries don't match: %+v", b)
-	}
-
-	for i, entry := range b.Entries {
-		if entry.meta&bitFinTxn != 0 {
-			continue
-		}
-		if db.shouldWriteValueToLSM(*entry) { // Will include deletion / tombstone case.
-			db.mt.Put(entry.Key,
-				y.ValueStruct{
-					Value:     entry.Value,
-					Meta:      entry.meta,
-					UserMeta:  entry.UserMeta,
-					ExpiresAt: entry.ExpiresAt,
-				})
-		} else {
-			var offsetBuf [vptrSize]byte
-			db.mt.Put(entry.Key,
-				y.ValueStruct{
-					Value:     b.Ptrs[i].Encode(offsetBuf[:]),
-					Meta:      entry.meta | bitValuePointer,
-					UserMeta:  entry.UserMeta,
-					ExpiresAt: entry.ExpiresAt,
-				})
-		}
-	}
-	return nil
-}
-
-// writeRequests is called serially by only one goroutine.
-func (db *DB) writeRequests(reqs []*request) error {
-	if len(reqs) == 0 {
-		return nil
-	}
-
-	done := func(err error) {
-		for _, r := range reqs {
-			r.Err = err
-			r.Wg.Done()
-		}
-	}
-	db.elog.Printf("writeRequests called. Writing to value log")
-
-	err := db.vlog.write(reqs)
-	if err != nil {
-		done(err)
-		return err
-	}
-
-	db.elog.Printf("Sending updates to subscribers")
-	db.pub.sendUpdates(reqs)
-	db.elog.Printf("Writing to memtable")
-	var count int
-	for _, b := range reqs {
-		if len(b.Entries) == 0 {
-			continue
-		}
-		count += len(b.Entries)
-		var i uint64
-		for err = db.ensureRoomForWrite(); err == errNoRoom; err = db.ensureRoomForWrite() {
-			i++
-			if i%100 == 0 {
-				db.elog.Printf("Making room for writes")
-			}
-			// We need to poll a bit because both hasRoomForWrite and the flusher need access to s.imm.
-			// When flushChan is full and you are blocked there, and the flusher is trying to update s.imm,
-			// you will get a deadlock.
-			time.Sleep(10 * time.Millisecond)
-		}
-		if err != nil {
-			done(err)
-			return errors.Wrap(err, "writeRequests")
-		}
-		if err := db.writeToLSM(b); err != nil {
-			done(err)
-			return errors.Wrap(err, "writeRequests")
-		}
-		db.updateHead(b.Ptrs)
-	}
-	done(nil)
-	db.elog.Printf("%d entries written", count)
-	return nil
-}
-
 func (db *DB) sendToWriteCh(entries []*Entry) (*request, error) {
 	if atomic.LoadInt32(&db.blockWrites) == 1 {
 		return nil, ErrBlockedWrites
@@ -694,74 +606,10 @@ func (db *DB) sendToWriteCh(entries []*Entry) (*request, error) {
 	req.Wg.Add(1)
 	req.IncrRef()     // for db write
 	req.IncrRef()     // for publisher updates
-	db.writeCh <- req // Handled in doWrites.
+	db.writeCh <- req // Handled in writeWorkers.
 	y.NumPuts.Add(int64(len(entries)))
 
 	return req, nil
-}
-
-func (db *DB) doWrites(lc *y.Closer) {
-	defer lc.Done()
-	pendingCh := make(chan struct{}, 1)
-
-	writeRequests := func(reqs []*request) {
-		if err := db.writeRequests(reqs); err != nil {
-			db.opt.Errorf("writeRequests: %v", err)
-		}
-		<-pendingCh
-	}
-
-	// This variable tracks the number of pending writes.
-	reqLen := new(expvar.Int)
-	y.PendingWrites.Set(db.opt.Dir, reqLen)
-
-	reqs := make([]*request, 0, 10)
-	for {
-		var r *request
-		select {
-		case r = <-db.writeCh:
-		case <-lc.HasBeenClosed():
-			goto closedCase
-		}
-
-		for {
-			reqs = append(reqs, r)
-			reqLen.Set(int64(len(reqs)))
-
-			if len(reqs) >= 3*kvWriteChCapacity {
-				pendingCh <- struct{}{} // blocking.
-				goto writeCase
-			}
-
-			select {
-			// Either push to pending, or continue to pick from writeCh.
-			case r = <-db.writeCh:
-			case pendingCh <- struct{}{}:
-				goto writeCase
-			case <-lc.HasBeenClosed():
-				goto closedCase
-			}
-		}
-
-	closedCase:
-		// All the pending request are drained.
-		// Don't close the writeCh, because it has be used in several places.
-		for {
-			select {
-			case r = <-db.writeCh:
-				reqs = append(reqs, r)
-			default:
-				pendingCh <- struct{}{} // Push to pending before doing a write.
-				writeRequests(reqs)
-				return
-			}
-		}
-
-	writeCase:
-		go writeRequests(reqs)
-		reqs = make([]*request, 0, 10)
-		reqLen.Set(0)
-	}
 }
 
 // batchSet applies a list of badger.Entry. If a request level error occurs it
@@ -1332,8 +1180,7 @@ func (db *DB) blockWrite() {
 }
 
 func (db *DB) unblockWrite() {
-	db.closers.writes = y.NewCloser(1)
-	go db.doWrites(db.closers.writes)
+	db.closers.writes = startWriteWorker(db)
 
 	// Resume writes.
 	atomic.StoreInt32(&db.blockWrites, 0)
@@ -1347,23 +1194,30 @@ func (db *DB) prepareToDrop() func() {
 	// write it to db. Then, flush all the pending flushtask. So that, we
 	// don't miss any entries.
 	db.blockWrite()
-	reqs := make([]*request, 0, 10)
-	for {
-		select {
-		case r := <-db.writeCh:
-			reqs = append(reqs, r)
-		default:
-			if err := db.writeRequests(reqs); err != nil {
-				db.opt.Errorf("writeRequests: %v", err)
-			}
-			db.stopMemoryFlush()
-			return func() {
-				db.opt.Infof("Resuming writes")
-				db.startMemoryFlush()
-				db.unblockWrite()
-			}
-		}
+
+	db.stopMemoryFlush()
+	return func() {
+		db.opt.Infof("Resuming writes")
+		db.startMemoryFlush()
+		db.unblockWrite()
 	}
+	// reqs := make([]*request, 0, 10)
+	// for {
+	// 	select {
+	// 	case r := <-db.writeCh:
+	// 		reqs = append(reqs, r)
+	// 	default:
+	// 		if err := db.writeRequests(reqs); err != nil {
+	// 			db.opt.Errorf("writeRequests: %v", err)
+	// 		}
+	// 		db.stopMemoryFlush()
+	// 		return func() {
+	// 			db.opt.Infof("Resuming writes")
+	// 			db.startMemoryFlush()
+	// 			db.unblockWrite()
+	// 		}
+	// 	}
+	// }
 }
 
 // DropAll would drop all the data stored in Badger. It does this in the following way.
