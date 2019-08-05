@@ -1132,16 +1132,16 @@ func valueBytesToEntry(buf []byte) (e Entry) {
 	return
 }
 
-func (vlog *valueLog) pickLog(head valuePointer, tr trace.Trace) (files []*logFile) {
+func (vlog *valueLog) pickFromDiscardStats(head valuePointer, tr trace.Trace) (*logFile, int64) {
 	vlog.filesLock.RLock()
 	defer vlog.filesLock.RUnlock()
 	fids := vlog.sortedFids()
 	if len(fids) <= 1 {
 		tr.LazyPrintf("Only one or less value log file.")
-		return nil
+		return nil, 0
 	} else if head.Fid == 0 {
 		tr.LazyPrintf("Head pointer is at zero.")
-		return nil
+		return nil, 0
 	}
 
 	// Pick a candidate that contains the largest amount of discardable data
@@ -1163,25 +1163,28 @@ func (vlog *valueLog) pickLog(head valuePointer, tr trace.Trace) (files []*logFi
 
 	if candidate.fid != math.MaxUint32 { // Found a candidate
 		tr.LazyPrintf("Found candidate via discard stats: %v", candidate)
-		files = append(files, vlog.filesMap[candidate.fid])
-		return files
+		return vlog.filesMap[candidate.fid], candidate.discard
 	}
+	return nil, 0
+}
 
-	tr.LazyPrintf("Could not find candidate via discard stats. Randomly picking one.")
-
+func (vlog *valueLog) pickRandomFile(head valuePointer, tr trace.Trace) *logFile {
 	// Fallback to randomly picking a log file.
 	if head.Fid == 0 { // Not found or first file
 		tr.LazyPrintf("Could not find any file.")
 		return nil
 	}
+	vlog.filesLock.RLock()
+	defer vlog.filesLock.RUnlock()
+
+	fids := vlog.sortedFids()
 	// Don’t include head.Fid. We pick a random file before it.
 	idx := rand.Intn(int(head.Fid))
 	if idx > 0 {
 		idx = rand.Intn(idx + 1) // Another level of rand to favor smaller fids.
 	}
 	tr.LazyPrintf("Randomly chose fid: %d", fids[idx])
-	files = append(files, vlog.filesMap[fids[idx]])
-	return files
+	return vlog.filesMap[fids[idx]]
 }
 
 func discardEntry(e Entry, vs y.ValueStruct) bool {
@@ -1355,20 +1358,25 @@ func (vlog *valueLog) runGC(discardRatio float64, head valuePointer) error {
 
 		var err error
 		// Pick a log file for GC.
-		files := vlog.pickLog(head, tr)
-		if len(files) == 0 {
-			tr.LazyPrintf("PickLog returned zero results.")
+		file, discard := vlog.pickFromDiscardStats(head, tr)
+		// Found a valid file from discard stats.
+		if file != nil {
+			// Ensure we have enough content to discard.
+			if float64(discard) > discardRatio*float64(file.size) {
+				err := vlog.rewrite(file, tr)
+				if err == nil {
+					return vlog.deleteMoveKeysFor(file.fid, tr)
+				}
+				return err
+			}
 			return ErrNoRewrite
 		}
-		tried := make(map[uint32]bool)
-		for _, lf := range files {
-			if _, done := tried[lf.fid]; done {
-				continue
-			}
-			tried[lf.fid] = true
-			err = vlog.doRunGC(lf, discardRatio, tr)
+		tr.LazyPrintf("Could not find candidate via discard stats. Randomly picking one.")
+		file = vlog.pickRandomFile(head, tr)
+		if file != nil {
+			err = vlog.doRunGC(file, discardRatio, tr)
 			if err == nil {
-				return vlog.deleteMoveKeysFor(lf.fid, tr)
+				return vlog.deleteMoveKeysFor(file.fid, tr)
 			}
 		}
 		return err
