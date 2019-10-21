@@ -30,9 +30,7 @@ import (
 	"sync/atomic"
 	"unsafe"
 
-	"github.com/DataDog/zstd"
 	"github.com/golang/protobuf/proto"
-	"github.com/golang/snappy"
 	"github.com/pkg/errors"
 
 	"github.com/dgraph-io/badger/options"
@@ -529,17 +527,4 @@ func IDToFilename(id uint64) string {
 // filepath.
 func NewFilename(id uint64, dir string) string {
 	return filepath.Join(dir, IDToFilename(id))
-}
-
-// decompressData decompresses the given data.
-func (t *Table) decompressData(data []byte) ([]byte, error) {
-	switch t.opt.Compression {
-	case options.None:
-		return data, nil
-	case options.Snappy:
-		return snappy.Decode(nil, data)
-	case options.ZSTD:
-		return zstd.Decompress(nil, data)
-	}
-	return nil, errors.New("Unsupported compression type")
 }

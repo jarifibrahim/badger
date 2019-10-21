@@ -22,11 +22,8 @@ import (
 	"math"
 	"unsafe"
 
-	"github.com/DataDog/zstd"
 	"github.com/dgryski/go-farm"
 	"github.com/golang/protobuf/proto"
-	"github.com/golang/snappy"
-	"github.com/pkg/errors"
 
 	"github.com/dgraph-io/badger/options"
 	"github.com/dgraph-io/badger/pb"
@@ -337,17 +334,4 @@ func (b *Builder) encrypt(data []byte) ([]byte, error) {
 // We encrypt only if the data key exist. Otherwise, not.
 func (b *Builder) shouldEncrypt() bool {
 	return b.opt.DataKey != nil
-}
-
-// compressData compresses the given data.
-func (b *Builder) compressData(data []byte) ([]byte, error) {
-	switch b.opt.Compression {
-	case options.None:
-		return data, nil
-	case options.Snappy:
-		return snappy.Encode(nil, data), nil
-	case options.ZSTD:
-		return zstd.Compress(nil, data)
-	}
-	return nil, errors.New("Unsupported compression type")
 }
